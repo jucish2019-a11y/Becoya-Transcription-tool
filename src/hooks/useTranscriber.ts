@@ -22,6 +22,7 @@ export interface TranscribeOptions {
 interface ChunkOutput {
   segments: Segment[];
   flags: QualityFlag[];
+  speakerProfiles?: Record<string, string>;
 }
 
 export type SessionStatus = 'transcribing' | 'paused' | 'failed' | 'completed';
@@ -83,15 +84,21 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
   /** Speakers and last turns from the parts before `index`, so labels stay consistent. */
   const buildContext = (s: Session, index: number) => {
     const speakers: string[] = [];
+    const profiles: Record<string, string> = {};
     let tail: Segment[] = [];
     for (let k = 0; k < index; k++) {
       const r = s.results[k];
-      if (!r) continue;
+      if (!r || !Array.isArray(r.segments)) continue;
       for (const sp of uniqueSpeakers(r.segments)) if (!speakers.includes(sp)) speakers.push(sp);
+      if (r.speakerProfiles) Object.assign(profiles, r.speakerProfiles);
       if (r.segments.length > 0) tail = r.segments;
     }
     if (speakers.length === 0) return undefined;
-    return { speakers, tail: tail.slice(-4).map((t) => ({ speaker: t.speaker, text: t.text })) };
+    return {
+      speakers,
+      speakerProfiles: Object.keys(profiles).length > 0 ? profiles : undefined,
+      tail: tail.slice(-4).map((t) => ({ speaker: t.speaker, text: t.text })),
+    };
   };
 
   const transcribeOne = async (s: Session, index: number, signal: AbortSignal): Promise<ChunkOutput> => {
@@ -120,14 +127,23 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
     try {
       data = await response.json();
     } catch {
-      /* non-JSON error page */
+      data = null;
     }
-    if (!response.ok) {
-      throw new Error(data?.error || `Transcription failed (HTTP ${response.status}).`);
+    if (!response.ok || !data || !Array.isArray(data.segments)) {
+      throw new Error(
+        data?.error ||
+          (!response.ok
+            ? `Transcription failed (HTTP ${response.status}).`
+            : 'Server returned an invalid response. Please retry this part.')
+      );
     }
 
-    const segments = withIds(data.segments ?? []).map((seg) => ({ ...seg, chunk: index }));
-    return { segments, flags: (data.flags ?? []) as QualityFlag[] };
+    const segments = withIds(data.segments).map((seg) => ({ ...seg, chunk: index }));
+    const speakerProfiles =
+      data.speakerProfiles && typeof data.speakerProfiles === 'object' && !Array.isArray(data.speakerProfiles)
+        ? data.speakerProfiles
+        : undefined;
+    return { segments, flags: (data.flags ?? []) as QualityFlag[], speakerProfiles };
   };
 
   const commitChunk = (s: Session, index: number, output: ChunkOutput) => {
@@ -136,12 +152,16 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
     const total = s.chunks.length;
 
     updateItem(s.historyId, (item) => {
+      if (!item) return item;
+      const currentSegments = Array.isArray(item.segments) ? item.segments : [];
+      const currentFlags = Array.isArray(item.flags) ? item.flags : [];
+
       // Replace only this part so edits made to other parts are never overwritten.
-      const others = item.segments.filter((seg) => seg.chunk !== index);
+      const others = currentSegments.filter((seg) => seg.chunk !== index);
       const segments = [...others, ...output.segments].sort(
         (a, b) => (a.chunk ?? -1) - (b.chunk ?? -1) || a.start - b.start
       );
-      const flags = [...item.flags.filter((f) => f.chunk !== index), ...output.flags].sort(
+      const flags = [...currentFlags.filter((f) => f.chunk !== index), ...output.flags].sort(
         (a, b) => a.chunk - b.chunk
       );
       return {
@@ -161,7 +181,9 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
     setStatusText('Complete!');
     setProgress(100);
     updateItem(s.historyId, (item) => {
-      const first = item.segments[0]?.text.split(/\s+/).filter(Boolean) ?? [];
+      if (!item) return item;
+      const currentSegments = Array.isArray(item.segments) ? item.segments : [];
+      const first = currentSegments[0]?.text.split(/\s+/).filter(Boolean) ?? [];
       const generated = first.slice(0, 5).join(' ') + (first.length > 5 ? '...' : '');
       const useGenerated =
         generated && (!item.title || DEFAULT_TITLES.includes(item.title) || item.title.startsWith('Recording'));
@@ -240,7 +262,7 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
       pausedRef.current = false;
 
       try {
-        const { chunks, durationSec } = await chunkAudio(blob, mimeType, getModel(options.model)?.chunkSec ?? 300);
+        const { chunks, durationSec } = await chunkAudio(blob, mimeType, getModel(options.model)?.chunkSec ?? 90);
         const id = newId();
         onStarted(id);
 

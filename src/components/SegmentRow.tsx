@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react';
+import { ArrowLeftRight } from 'lucide-react';
 import { Segment, formatTimestamp } from '../shared/transcript';
 import { SpeakerNames, speakerLabel } from '../utils/transcript';
 
@@ -84,23 +85,35 @@ export const SegmentRow = memo(function SegmentRow({
       }`}
     >
       <div className="w-32 shrink-0 flex flex-col items-start gap-1">
-        <select
-          value={seg.speaker}
-          onChange={(e) =>
-            onSetSpeaker(seg.id, e.target.value === NEW_SPEAKER ? nextSpeakerId(speakers) : e.target.value)
-          }
-          aria-label={`Speaker for turn at ${time}`}
-          className={`max-w-full text-xs font-semibold rounded-md border px-1.5 py-0.5 cursor-pointer truncate ${
-            SPEAKER_STYLES[colorIndex % SPEAKER_STYLES.length]
-          }`}
-        >
-          {speakers.map((sp) => (
-            <option key={sp} value={sp}>
-              {speakerLabel(sp, names)}
-            </option>
-          ))}
-          <option value={NEW_SPEAKER}>+ New speaker</option>
-        </select>
+        <div className="flex items-center gap-1 w-full">
+          <select
+            value={seg.speaker}
+            onChange={(e) =>
+              onSetSpeaker(seg.id, e.target.value === NEW_SPEAKER ? nextSpeakerId(speakers) : e.target.value)
+            }
+            aria-label={`Speaker for turn at ${time}`}
+            className={`flex-1 min-w-0 text-xs font-semibold rounded-md border px-1.5 py-0.5 cursor-pointer truncate ${
+              SPEAKER_STYLES[colorIndex % SPEAKER_STYLES.length]
+            }`}
+          >
+            {speakers.map((sp) => (
+              <option key={sp} value={sp}>
+                {speakerLabel(sp, names)}
+              </option>
+            ))}
+            <option value={NEW_SPEAKER}>+ New speaker</option>
+          </select>
+          {speakers.length === 2 && (
+            <button
+              type="button"
+              onClick={() => onSetSpeaker(seg.id, speakers[0] === seg.speaker ? speakers[1] : speakers[0])}
+              title={`Switch turn to ${speakerLabel(speakers[0] === seg.speaker ? speakers[1] : speakers[0], names)}`}
+              className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-zinc-400 hover:text-indigo-600 hover:bg-indigo-50 transition-all shrink-0"
+            >
+              <ArrowLeftRight className="w-3 h-3" />
+            </button>
+          )}
+        </div>
         {canSeek ? (
           <button
             type="button"

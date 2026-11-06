@@ -204,7 +204,7 @@ export function baseMimeType(mime: string): string {
 export async function chunkAudio(
   audioBlob: Blob,
   mimeType: string,
-  targetChunkSec = 300
+  targetChunkSec = 180
 ): Promise<ChunkResult> {
   let audioBuffer: AudioBuffer;
   try {

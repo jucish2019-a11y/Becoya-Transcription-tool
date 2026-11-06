@@ -1,13 +1,16 @@
 import {
   AlertTriangle,
+  ArrowLeftRight,
   AudioLines,
   Check,
   Copy,
   FileAudio,
+  Loader2,
   Pause,
   Play,
   RefreshCw,
   Replace,
+  Sparkles,
   Tag,
   Undo2,
   Users,
@@ -107,6 +110,95 @@ export function TranscriptPanel({
     [onSegments]
   );
 
+  const [isFixingSpeakers, setIsFixingSpeakers] = useState(false);
+
+  const doSwapSpeakers = useCallback(
+    (spA: string, spB: string) => {
+      if (!spA || !spB || spA === spB) return;
+      const snapshot = segments;
+      onSegments((segs) =>
+        segs.map((s) => {
+          if (s.speaker === spA) return { ...s, speaker: spB };
+          if (s.speaker === spB) return { ...s, speaker: spA };
+          return s;
+        })
+      );
+      onSpeakerNames((prev) => {
+        const next = { ...prev };
+        const nameA = next[spA];
+        const nameB = next[spB];
+        if (nameA !== undefined) next[spB] = nameA;
+        else delete next[spB];
+        if (nameB !== undefined) next[spA] = nameB;
+        else delete next[spA];
+        return next;
+      });
+      showNotice(`Swapped ${speakerLabel(spA, names)} ⇄ ${speakerLabel(spB, names)}.`, snapshot);
+    },
+    [segments, onSegments, onSpeakerNames, names, showNotice]
+  );
+
+  const doUntangleSpeakers = useCallback(async () => {
+    if (!segments.length || isFixingSpeakers) return;
+    setIsFixingSpeakers(true);
+    try {
+      const res = await fetch('/api/fix-speakers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: segments.map((s) => ({ id: s.id, speaker: s.speaker, text: s.text, start: s.start })),
+          expectedSpeakers: speakers.length,
+          speakerNames: names,
+        }),
+      });
+      if (!res.ok) throw new Error('Failed to untangle speakers.');
+      const data = await res.json();
+      const corrections: Array<{ id: string; speaker: string }> = data.corrections || [];
+      if (!corrections.length) {
+        showNotice('No speaker changes needed; dialogue is aligned.');
+        return;
+      }
+      const corrMap = new Map(corrections.map((c) => [c.id, c.speaker]));
+      let changed = 0;
+      const snapshot = segments;
+      onSegments((segs) =>
+        segs.map((s) => {
+          const corrected = corrMap.get(s.id);
+          if (corrected && corrected !== s.speaker) {
+            changed++;
+            return { ...s, speaker: corrected };
+          }
+          return s;
+        })
+      );
+      showNotice(
+        changed > 0 ? `Untangled speakers: corrected ${changed} turn(s).` : 'Speakers are already consistently aligned.',
+        snapshot
+      );
+    } catch (err: any) {
+      showNotice(err?.message || 'Could not untangle speakers.');
+    } finally {
+      setIsFixingSpeakers(false);
+    }
+  }, [segments, isFixingSpeakers, speakers.length, names, onSegments, showNotice]);
+
+  const doReplace = (close: () => void) => {
+    const snapshot = segments;
+    const r = findReplace(segments, find, replace, { caseSensitive });
+    if (r.count === 0) return;
+    onSegments(() => r.segments);
+    showNotice(`Replaced ${r.count} occurrence${r.count === 1 ? '' : 's'}.`, snapshot);
+    close();
+  };
+
+  const doCleanUp = () => {
+    const snapshot = segments;
+    const r = cleanSegments(segments);
+    if (r.changed === 0) return showNotice('Nothing to clean up: no fillers or stutters found.');
+    onSegments(() => r.segments);
+    showNotice(`Cleaned ${r.changed} turn${r.changed === 1 ? '' : 's'}.`, snapshot);
+  };
+
   if (!item) {
     return (
       <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-500 p-6 text-center">
@@ -132,6 +224,8 @@ export function TranscriptPanel({
     speakerNames: names,
   };
 
+  const matchCount = countMatches(segments, find, caseSensitive);
+
   const copyAll = async () => {
     const text = segments.map((s) => `${speakerLabel(s.speaker, names)}: ${s.text}`).join('\n\n');
     try {
@@ -141,25 +235,6 @@ export function TranscriptPanel({
     } catch (err) {
       console.error('Failed to copy text:', err);
     }
-  };
-
-  const matchCount = countMatches(segments, find, caseSensitive);
-
-  const doReplace = (close: () => void) => {
-    const snapshot = segments;
-    const r = findReplace(segments, find, replace, { caseSensitive });
-    if (r.count === 0) return;
-    onSegments(() => r.segments);
-    showNotice(`Replaced ${r.count} occurrence${r.count === 1 ? '' : 's'}.`, snapshot);
-    close();
-  };
-
-  const doCleanUp = () => {
-    const snapshot = segments;
-    const r = cleanSegments(segments);
-    if (r.changed === 0) return showNotice('Nothing to clean up: no fillers or stutters found.');
-    onSegments(() => r.segments);
-    showNotice(`Cleaned ${r.changed} turn${r.changed === 1 ? '' : 's'}.`, snapshot);
   };
 
   const flagsByChunk = new Map<number, typeof item.flags>();
@@ -210,7 +285,7 @@ export function TranscriptPanel({
           <div className="flex flex-wrap items-center gap-1">
             <Popover
               ariaLabel="Rename speakers"
-              title="Rename speakers"
+              title="Speakers & Alignment"
               label={
                 <>
                   <Users className="h-3.5 w-3.5" aria-hidden="true" />
@@ -219,39 +294,103 @@ export function TranscriptPanel({
               }
             >
               {() => (
-                <div className="space-y-2">
-                  <p className="text-xs text-zinc-600 leading-snug">
-                    Give each speaker a name. It updates the whole transcript and every export. Use the same name for two
-                    speakers to merge them.
-                  </p>
-                  {speakers.map((sp) => {
-                    const turns = segments.filter((s) => s.speaker === sp).length;
-                    return (
-                      <div key={sp} className="flex items-center gap-2">
-                        <span className="w-20 shrink-0 text-[11px] text-zinc-500 truncate" title={sp}>
-                          {sp} · {turns}
-                        </span>
-                        <input
-                          type="text"
-                          defaultValue={names[sp] ?? ''}
-                          placeholder="Name or role"
-                          aria-label={`Name for ${sp}`}
-                          onBlur={(e) => {
-                            const v = e.target.value.trim();
-                            if ((names[sp] ?? '') !== v) {
-                              onSpeakerNames((prev) => {
-                                const next = { ...prev };
-                                if (v) next[sp] = v;
-                                else delete next[sp];
-                                return next;
-                              });
-                            }
-                          }}
-                          className="flex-1 min-w-0 text-xs p-1.5 border border-zinc-200 rounded focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        />
+                <div className="space-y-3 w-72">
+                  <div>
+                    <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1">
+                      Speaker Names
+                    </div>
+                    <p className="text-xs text-zinc-600 leading-snug mb-2">
+                      Give each speaker a name. It updates the whole transcript and every export.
+                    </p>
+                    <div className="space-y-1.5">
+                      {speakers.map((sp) => {
+                        const turns = segments.filter((s) => s.speaker === sp).length;
+                        return (
+                          <div key={sp} className="flex items-center gap-2">
+                            <span className="w-24 shrink-0 text-[11px] text-zinc-500 truncate" title={sp}>
+                              {sp} · {turns}
+                            </span>
+                            <input
+                              type="text"
+                              defaultValue={names[sp] ?? ''}
+                              placeholder="Name or role"
+                              aria-label={`Name for ${sp}`}
+                              onBlur={(e) => {
+                                const v = e.target.value.trim();
+                                if ((names[sp] ?? '') !== v) {
+                                  onSpeakerNames((prev) => {
+                                    const next = { ...prev };
+                                    if (v) next[sp] = v;
+                                    else delete next[sp];
+                                    return next;
+                                  });
+                                }
+                              }}
+                              className="flex-1 min-w-0 text-xs p-1.5 border border-zinc-200 rounded focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {speakers.length >= 2 && (
+                    <div className="pt-2 border-t border-zinc-100">
+                      <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1.5">
+                        Swap Inverted Speakers
                       </div>
-                    );
-                  })}
+                      <p className="text-[11px] text-zinc-500 mb-2 leading-tight">
+                        If two speakers got mixed up or swapped, switch all their turns with one click:
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {speakers.length === 2 ? (
+                          <button
+                            type="button"
+                            onClick={() => doSwapSpeakers(speakers[0], speakers[1])}
+                            className="w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 transition-colors"
+                          >
+                            <ArrowLeftRight className="w-3.5 h-3.5" />
+                            Swap {speakerLabel(speakers[0], names)} ⇄ {speakerLabel(speakers[1], names)}
+                          </button>
+                        ) : (
+                          speakers.map((spA, i) =>
+                            speakers.slice(i + 1).map((spB) => (
+                              <button
+                                key={`${spA}-${spB}`}
+                                type="button"
+                                onClick={() => doSwapSpeakers(spA, spB)}
+                                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded bg-zinc-100 hover:bg-indigo-50 hover:text-indigo-700 border border-zinc-200 transition-colors"
+                              >
+                                <ArrowLeftRight className="w-3 h-3" />
+                                {speakerLabel(spA, names)} ⇄ {speakerLabel(spB, names)}
+                              </button>
+                            ))
+                          )
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="pt-2 border-t border-zinc-100">
+                    <button
+                      type="button"
+                      disabled={isFixingSpeakers}
+                      onClick={doUntangleSpeakers}
+                      className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 disabled:opacity-50 transition-colors"
+                    >
+                      {isFixingSpeakers ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Untangling speaker turns...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                          Fix Speaker Mix-Up with AI
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
               )}
             </Popover>
@@ -316,6 +455,24 @@ export function TranscriptPanel({
               <Wand2 className="h-3.5 w-3.5" aria-hidden="true" />
               Clean up
             </button>
+
+            {speakers.length >= 2 && (
+              <button
+                type="button"
+                onClick={doUntangleSpeakers}
+                disabled={isTranscribing || isFixingSpeakers}
+                className={subtleButton}
+                title="AI analyzes conversation flow and automatically aligns swapped or misattributed speaker turns"
+                aria-label="Fix speakers"
+              >
+                {isFixingSpeakers ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" aria-hidden="true" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5 text-indigo-600" aria-hidden="true" />
+                )}
+                {isFixingSpeakers ? 'Fixing…' : 'Fix speakers'}
+              </button>
+            )}
 
             <button type="button" onClick={copyAll} className={subtleButton} aria-label={isCopied ? 'Copied to clipboard' : 'Copy to clipboard'}>
               {isCopied ? <Check className="h-3.5 w-3.5 text-emerald-600" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5" aria-hidden="true" />}

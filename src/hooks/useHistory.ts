@@ -27,6 +27,17 @@ export interface HistoryItem {
 const STORAGE_KEY = 'transcriptionHistory';
 
 function hydrate(raw: any): HistoryItem {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      id: String(Date.now()),
+      title: 'Untitled',
+      date: new Date().toISOString(),
+      content: '',
+      segments: [],
+      speakerNames: {},
+      flags: [],
+    };
+  }
   const segments: Segment[] = Array.isArray(raw.segments)
     ? raw.segments
     : raw.content

@@ -17,6 +17,8 @@ import {
 export interface TranscribeContext {
   /** Speaker ids identified in earlier parts, in order of first appearance. */
   speakers: string[];
+  /** Acoustic voice profiles of identified speakers so far (gender, pitch, timbre). */
+  speakerProfiles?: Record<string, string>;
   /** The last few turns of the previous part, for continuity. */
   tail: Array<{ speaker: string; text: string }>;
 }
@@ -37,6 +39,7 @@ export interface TranscribeResponse {
   /** Turns with timestamps in seconds from the start of the full recording. */
   segments: RawSegment[];
   flags: QualityFlag[];
+  speakerProfiles?: Record<string, string>;
 }
 
 export class RequestError extends Error {
@@ -101,8 +104,17 @@ export function validateRequest(body: any): TranscribeRequest {
 
   let ctx: TranscribeContext | undefined;
   if (context && Array.isArray(context.speakers)) {
+    const profiles: Record<string, string> = {};
+    if (context.speakerProfiles && typeof context.speakerProfiles === 'object' && !Array.isArray(context.speakerProfiles)) {
+      for (const [k, v] of Object.entries(context.speakerProfiles)) {
+        if (typeof v === 'string' && v.trim()) {
+          profiles[normalizeSpeaker(k)] = v.trim().slice(0, 300);
+        }
+      }
+    }
     ctx = {
       speakers: context.speakers.filter((s: unknown) => typeof s === 'string').slice(0, 20),
+      speakerProfiles: Object.keys(profiles).length > 0 ? profiles : undefined,
       tail: Array.isArray(context.tail)
         ? context.tail
             .filter((t: any) => t && typeof t.speaker === 'string' && typeof t.text === 'string')
@@ -144,8 +156,15 @@ export function buildPrompt(req: TranscribeRequest): { systemInstruction: string
     '',
     'Rules:',
     '1. Transcribe exactly what is said, in the language it is spoken. NEVER translate. If speakers switch language, keep each part in the language spoken.',
-    '2. Label speakers "Speaker 1", "Speaker 2", and so on, by distinct voice. Do NOT use names or roles (such as Moderator) as labels, even if people introduce themselves. The same voice must always get the same label.',
-    '3. Start a new turn whenever the speaker changes. Never put words from two speakers in one turn. Split a long monologue into turns at natural sentence breaks roughly every 30-60 seconds.',
+    '2. SPEAKER DIARIZATION (CRITICAL - DO NOT MIX UP SPEAKERS):',
+    '   - Identify speakers strictly by their distinct physical voice characteristics: vocal pitch, timbre, vocal tract resonance, cadence, and gender.',
+    '   - Label speakers "Speaker 1", "Speaker 2", and so on. Do NOT use names or roles (such as Moderator) as labels, even if people introduce themselves.',
+    '   - The exact same physical voice must ALWAYS receive the exact same speaker label throughout the entire recording.',
+    '   - In the "speakerProfiles" field, document the physical voice characteristics for each distinct voice (e.g. "Speaker 1": "Adult male, deep pitch, steady pace", "Speaker 2": "Adult female, higher pitch, animated timbre").',
+    '3. TURNS & CONVERSATIONAL EXCHANGES:',
+    '   - Start a new turn immediately whenever the speaker changes. NEVER combine words from two different speakers into one turn.',
+    '   - In rapid back-and-forth dialogue, interruptions, or brief interjections ("yeah", "uh-huh", "right", "exactly"), attribute each utterance to the specific voice that spoke it.',
+    '   - Split a long monologue into turns at natural sentence breaks roughly every 30-60 seconds.',
     '4. Never invent, summarise, or paraphrase. Do not output text for silence, music or background noise. Use [inaudible] for words you cannot make out.',
     '5. Every turn has a "start" timestamp: the time the turn begins WITHIN THIS CLIP, where the clip itself starts at 00:00. Format MM:SS.',
     '6. Capitalise and punctuate normally. Do not add commentary, headings or notes.',
@@ -174,6 +193,14 @@ export function buildPrompt(req: TranscribeRequest): { systemInstruction: string
     lines.push(
       `Speakers identified so far: ${req.context.speakers.join(', ')}. Keep using these exact labels for the same voices. Only create a new label if you clearly hear a voice that is none of them.`
     );
+    if (req.context.speakerProfiles && Object.keys(req.context.speakerProfiles).length > 0) {
+      const profileLines = Object.entries(req.context.speakerProfiles)
+        .map(([sp, desc]) => `- ${sp}: ${desc}`)
+        .join('\n');
+      lines.push(
+        `ESTABLISHED SPEAKER ACOUSTIC PROFILES (CRITICAL FOR CONTINUITY):\n${profileLines}\n\nMatch every voice in this clip to the established speaker profiles above based on vocal pitch and timbre. Do NOT renumber or swap speakers based on who speaks first in this part!`
+      );
+    }
     if (req.context.tail.length > 0) {
       const tail = req.context.tail.map((t) => `[${t.speaker}] ${t.text}`).join('\n');
       lines.push(`The previous part ended with the following (do NOT repeat it):\n${tail}`);
@@ -186,6 +213,22 @@ export function buildPrompt(req: TranscribeRequest): { systemInstruction: string
 export const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
+    speakerProfiles: {
+      type: Type.ARRAY,
+      description: 'Physical acoustic descriptions of each distinct voice heard (e.g. pitch, timbre, vocal tone, gender, cadence) to track them consistently across the audio.',
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          speaker: { type: Type.STRING, description: 'Speaker label, e.g. "Speaker 1".' },
+          voiceDescription: {
+            type: Type.STRING,
+            description:
+              'Acoustic voice characteristics: gender/pitch (deep, mid, high), timbre, pacing, accent. E.g. "Deep male voice, slow pace, American accent" or "Higher-pitch female voice, fast speech".',
+          },
+        },
+        required: ['speaker', 'voiceDescription'],
+      },
+    },
     segments: {
       type: Type.ARRAY,
       items: {
@@ -221,8 +264,25 @@ export function parseModelJson(text: string): Array<{ speaker: string; start: nu
     throw new ParseError('Model returned invalid JSON.');
   }
 
-  const list = Array.isArray(data) ? data : (data as any)?.segments;
-  if (!Array.isArray(list)) throw new ParseError('Model response had no segments.');
+  // Handle { segments: [...] }, bare array [...], { segments: null }, or empty {}
+  let list: any[] = [];
+  if (Array.isArray(data)) {
+    list = data;
+  } else if (data && typeof data === 'object') {
+    const s = (data as any).segments;
+    if (Array.isArray(s)) {
+      list = s;
+    } else if (s === null || s === undefined) {
+      // Model returned { segments: null } or {} when no speech/transcription occurred in this part
+      list = [];
+    } else {
+      throw new ParseError('Model response had invalid segments format.');
+    }
+  } else if (data === null) {
+    list = [];
+  } else {
+    throw new ParseError('Model response had no segments.');
+  }
 
   const out: Array<{ speaker: string; start: number | null; text: string }> = [];
   for (const item of list) {
@@ -235,6 +295,31 @@ export function parseModelJson(text: string): Array<{ speaker: string; start: nu
       text,
     });
   }
+
+  // Extract speakerProfiles if provided
+  const speakerProfiles: Record<string, string> = {};
+  if (data && typeof data === 'object') {
+    const rawProfiles = (data as any).speakerProfiles;
+    if (Array.isArray(rawProfiles)) {
+      for (const p of rawProfiles) {
+        if (p && typeof p.speaker === 'string' && typeof p.voiceDescription === 'string') {
+          const norm = normalizeSpeaker(p.speaker);
+          const desc = p.voiceDescription.trim();
+          if (norm && desc) speakerProfiles[norm] = desc;
+        }
+      }
+    } else if (rawProfiles && typeof rawProfiles === 'object') {
+      for (const [k, v] of Object.entries(rawProfiles)) {
+        if (typeof v === 'string' && v.trim()) {
+          speakerProfiles[normalizeSpeaker(k)] = v.trim();
+        }
+      }
+    }
+  }
+  if (Object.keys(speakerProfiles).length > 0) {
+    (out as any).speakerProfiles = speakerProfiles;
+  }
+
   return out;
 }
 
@@ -338,5 +423,9 @@ export async function transcribeChunk(
     });
   }
 
-  return { segments, flags };
+  return {
+    segments,
+    flags,
+    speakerProfiles: (parsed as any)?.speakerProfiles,
+  };
 }

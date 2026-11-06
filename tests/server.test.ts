@@ -43,15 +43,21 @@ describe('buildPrompt', () => {
     const req = validateRequest({
       ...base,
       vocabulary: 'Becoya, SFDA',
-      context: { speakers: ['Speaker 1', 'Speaker 2'], tail: [{ speaker: 'Speaker 2', text: 'and that was it.' }] },
+      context: {
+        speakers: ['Speaker 1', 'Speaker 2'],
+        speakerProfiles: { 'Speaker 1': 'Deep male voice, slow pace', 'Speaker 2': 'High pitch female voice' },
+        tail: [{ speaker: 'Speaker 2', text: 'and that was it.' }],
+      },
     });
     const { userText, systemInstruction } = buildPrompt(req);
     expect(userText).toContain('part 2 of 3');
     expect(userText).toContain('5:00');
     expect(userText).toContain('Speaker 1, Speaker 2');
+    expect(userText).toContain('Deep male voice, slow pace');
     expect(userText).toContain('[Speaker 2] and that was it.');
     expect(userText).toContain('Becoya, SFDA');
     expect(systemInstruction).toContain('NEVER translate');
+    expect(systemInstruction).toContain('SPEAKER DIARIZATION');
   });
 });
 
@@ -64,9 +70,33 @@ describe('parseModelJson', () => {
     }
     expect(parseModelJson('```json\n' + JSON.stringify({ segments: [item] }) + '\n```')).toHaveLength(1);
   });
+  it('parses speakerProfiles along with segments', () => {
+    const payload = {
+      speakerProfiles: [
+        { speaker: 'Speaker 1', voiceDescription: 'Deep male voice' },
+        { speaker: 'Speaker 2', voiceDescription: 'High pitch female voice' },
+      ],
+      segments: [{ speaker: 'Speaker 1', start: '0:02', text: 'Hello' }],
+    };
+    const out: any = parseModelJson(JSON.stringify(payload));
+    expect(out).toHaveLength(1);
+    expect(out[0].speaker).toBe('Speaker 1');
+    expect(out.speakerProfiles).toEqual({
+      'Speaker 1': 'Deep male voice',
+      'Speaker 2': 'High pitch female voice',
+    });
+  });
   it('drops empty turns and throws on garbage', () => {
     expect(parseModelJson(JSON.stringify({ segments: [{ speaker: 'S1', start: '0:00', text: '  ' }] }))).toEqual([]);
     expect(() => parseModelJson('not json')).toThrow();
+  });
+  it('handles null segments and empty objects without crashing', () => {
+    expect(parseModelJson(JSON.stringify({ segments: null }))).toEqual([]);
+    expect(parseModelJson('{}')).toEqual([]);
+    expect(parseModelJson('null')).toEqual([]);
+    expect(parseModelJson('{"segments": [null, {"speaker": "Speaker 1", "start": "0:01", "text": "Valid"}]}')).toEqual([
+      { speaker: 'Speaker 1', start: 1, text: 'Valid' },
+    ]);
   });
 });
 

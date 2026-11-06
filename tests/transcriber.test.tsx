@@ -189,4 +189,40 @@ describe('useTranscriber', () => {
     expect(result.current.t.session).toBeNull();
     expect(result.current.t.isTranscribing).toBe(false);
   });
+
+  it('handles empty segments parts without crashing', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ segments: [], flags: [{ chunk: 0, startSec: 0, endSec: 300, code: 'empty', message: 'Silent' }] }),
+      })
+    );
+    const { result } = renderHook(useBoth);
+    await act(async () => {
+      await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+    });
+    expect(result.current.t.session?.status).toBe('completed');
+    expect(result.current.history[0].segments).toHaveLength(0);
+    expect(result.current.history[0].flags).toHaveLength(3); // 3 chunks, each returned the flag
+  });
+
+  it('handles invalid server responses with clear errors instead of throwing Cannot read properties of null', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => null,
+      })
+    );
+    const { result } = renderHook(useBoth);
+    await act(async () => {
+      await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+    });
+    expect(result.current.t.session?.status).toBe('failed');
+    expect(result.current.t.error).toContain('Server returned an invalid response');
+    expect(result.current.t.error).not.toContain('Cannot read properties of null');
+  });
 });

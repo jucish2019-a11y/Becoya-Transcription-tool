@@ -18,44 +18,61 @@ export interface ModelInfo {
 
 export const MODELS: ModelInfo[] = [
   {
-    id: 'gemini-3.7-flash',
-    name: 'Gemini 3.7 Flash',
-    shortLabel: '3.7 Flash',
-    description: 'Newest Flash model. Best default for accuracy and speaker separation.',
-    chunkSec: 300,
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash-Lite (★ Ultra-Fast, No Spikes)',
+    shortLabel: '3.1 Flash-Lite',
+    description: 'Fastest response time (~1s). Zero thinking delay, resilient to high demand spikes.',
+    chunkSec: 180,
     recommended: true,
   },
   {
-    id: 'gemini-3.6-flash',
-    name: 'Gemini 3.6 Flash',
-    shortLabel: '3.6 Flash',
-    description: 'Previous-generation Flash. Good fallback if 3.7 is rate-limited.',
-    chunkSec: 300,
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash (★ 1M Context Window)',
+    shortLabel: 'gemini-3.8-flash',
+    description: 'Premier multimodal model with massive 1M context window and acoustic voice tracking.',
+    chunkSec: 180,
   },
   {
     id: 'gemini-3.5-flash',
-    name: 'Gemini 3.5 Flash',
+    name: 'Gemini 3.5 Flash (High Throughput & Stable)',
     shortLabel: '3.5 Flash',
-    description: 'Stable general-purpose multimodal model.',
-    chunkSec: 300,
+    description: 'Proven high-throughput model with fast audio inference and reliable quotas.',
+    chunkSec: 180,
   },
   {
-    id: 'gemini-3.1-flash-lite',
-    name: 'Gemini 3.1 Flash-Lite',
-    shortLabel: '3.1 Flash-Lite',
-    description: 'Fastest and cheapest. Fine for clear two-speaker audio; weaker on crowded or noisy recordings.',
+    id: 'gemini-3.7-flash',
+    name: 'Gemini 3.7 Flash (High Accuracy - Fast Mode)',
+    shortLabel: '3.7 Flash',
+    description: 'Multimodal reasoning model tuned for rapid transcription with minimal thinking latency.',
+    chunkSec: 180,
+  },
+  {
+    id: 'gemini-3.5-transcribe',
+    name: 'Gemini 3.5 Transcribe (Google Dedicated Audio Engine)',
+    shortLabel: '3.5 Transcribe',
+    description: 'Specialized audio transcription engine optimized for verbatim accuracy on speech.',
+    chunkSec: 180,
+  },
+  {
+    id: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash (Fast & Accurate)',
+    shortLabel: '3.6 Flash',
+    description: 'Multimodal model with robust speaker separation and consistent availability.',
     chunkSec: 180,
   },
   {
     id: 'gemini-2.5-flash',
     name: 'Gemini 2.5 Flash',
     shortLabel: '2.5 Flash',
-    description: 'Older but widely available fallback.',
-    chunkSec: 300,
+    description: 'Legacy fallback model for compatibility.',
+    chunkSec: 180,
   },
 ];
 
-export const ALLOWED_MODEL_IDS = new Set(MODELS.map((m) => m.id));
+export const ALLOWED_MODEL_IDS = new Set([
+  ...MODELS.map((m) => m.id),
+  'gemini-flash-latest',
+]);
 
 export function getModel(id: string | undefined | null): ModelInfo | undefined {
   return MODELS.find((m) => m.id === id);

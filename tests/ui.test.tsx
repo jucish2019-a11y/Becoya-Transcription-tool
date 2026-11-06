@@ -83,6 +83,20 @@ describe('TranscriptPanel', () => {
     expect(labels).toEqual(['Moderator', 'Speaker 2', 'Moderator']);
   });
 
+  it('swaps two speakers across all turns in one click', async () => {
+    const user = userEvent.setup();
+    render(<Harness initial={baseItem()} />);
+
+    const selectsBefore = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    expect(selectsBefore.map((s) => s.value)).toEqual(['Speaker 1', 'Speaker 2', 'Speaker 1']);
+
+    await user.click(screen.getByRole('button', { name: 'Rename speakers' }));
+    await user.click(screen.getByRole('button', { name: /swap speaker 1 ⇄ speaker 2/i }));
+
+    const selectsAfter = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    expect(selectsAfter.map((s) => s.value)).toEqual(['Speaker 2', 'Speaker 1', 'Speaker 2']);
+  });
+
   it('reassigns a single turn to another speaker', async () => {
     const user = userEvent.setup();
     render(<Harness initial={baseItem()} />);
