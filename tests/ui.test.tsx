@@ -152,6 +152,66 @@ describe('TranscriptPanel', () => {
     expect(onRetry).toHaveBeenCalledWith(1);
   });
 
+  describe('suggest speaker fixes', () => {
+    const answer = (body: any, ok = true, status = 200) =>
+      vi.stubGlobal('fetch', vi.fn(async () => ({ ok, status, json: async () => body })));
+
+    const selectedLabels = () =>
+      (screen.getAllByRole('combobox') as HTMLSelectElement[]).map((s) => s.selectedOptions[0].textContent);
+
+    it('applies only valid suggestions, reports the true count, and can undo', async () => {
+      const user = userEvent.setup();
+      answer({
+        corrections: [
+          { id: 'a', speaker: 'Speaker 2' }, // a real change
+          { id: 'b', speaker: 'Speaker 9' }, // unknown label: must be ignored
+          { id: 'c', speaker: 'Speaker 1' }, // already that speaker: not a change
+          { id: 'zzz', speaker: 'Speaker 1' }, // no such turn
+        ],
+      });
+      render(<Harness initial={baseItem()} />);
+      expect(selectedLabels()).toEqual(['Speaker 1', 'Speaker 2', 'Speaker 1']);
+
+      await user.click(screen.getByRole('button', { name: 'Suggest speaker fixes' }));
+      expect(await screen.findByText(/Changed the speaker on 1 turn\./)).toBeTruthy();
+      expect(selectedLabels()).toEqual(['Speaker 2', 'Speaker 2', 'Speaker 1']);
+
+      const [url, init] = (fetch as any).mock.calls[0];
+      expect(url).toBe('/api/fix-speakers');
+      const sent = JSON.parse(init.body);
+      expect(sent.model).toBe('gemini-3.7-flash'); // the item's model is passed along
+      expect(sent.segments[0]).toEqual({ id: 'a', speaker: 'Speaker 1', text: 'Welcome to the Beacoya session.' });
+
+      await user.click(screen.getByRole('button', { name: /undo/i }));
+      expect(selectedLabels()).toEqual(['Speaker 1', 'Speaker 2', 'Speaker 1']);
+    });
+
+    it('says so when there is nothing to change', async () => {
+      const user = userEvent.setup();
+      answer({ corrections: [{ id: 'a', speaker: 'Speaker 9' }] });
+      render(<Harness initial={baseItem()} />);
+      await user.click(screen.getByRole('button', { name: 'Suggest speaker fixes' }));
+      expect(await screen.findByText(/No clear speaker mix-ups/)).toBeTruthy();
+      expect(selectedLabels()).toEqual(['Speaker 1', 'Speaker 2', 'Speaker 1']);
+    });
+
+    it('shows the server error instead of failing silently', async () => {
+      const user = userEvent.setup();
+      answer({ error: 'The speaker check took too long. Please try again.' }, false, 500);
+      render(<Harness initial={baseItem()} />);
+      await user.click(screen.getByRole('button', { name: 'Suggest speaker fixes' }));
+      expect(await screen.findByText(/took too long/)).toBeTruthy();
+    });
+
+    it('copes with a proxy HTML error page', async () => {
+      const user = userEvent.setup();
+      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 504, json: async () => { throw new SyntaxError('<'); } })));
+      render(<Harness initial={baseItem()} />);
+      await user.click(screen.getByRole('button', { name: 'Suggest speaker fixes' }));
+      expect(await screen.findByText(/HTTP 504/)).toBeTruthy();
+    });
+  });
+
   it('shows the empty state without an item', () => {
     render(<TranscriptPanel item={null} session={null} isTranscribing={false} audioUrl={null} onTitle={() => {}} onTag={() => {}} onSegments={() => {}} onSpeakerNames={() => {}} onResume={() => {}} onRetryChunk={() => {}} />);
     expect(screen.getByText('No transcription yet')).toBeTruthy();
@@ -182,8 +242,8 @@ describe('App with a transcript saved by the old version', () => {
 
     const sidebarItem = await screen.findByRole('button', { name: /load transcription: old interview/i });
     expect(within(sidebarItem).queryByText('95%')).toBeNull();
-    // Unknown legacy model ids fall back to showing the raw id rather than breaking.
-    expect(within(sidebarItem).getByText('gemini-3.8-flash')).toBeTruthy();
+    // Known models show a short label; a retired id would fall back to showing the raw id.
+    expect(within(sidebarItem).getByText('3.8 Flash')).toBeTruthy();
 
     await user.click(sidebarItem);
     expect(screen.getByText('Hello there.')).toBeTruthy();

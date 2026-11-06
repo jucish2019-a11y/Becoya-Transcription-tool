@@ -58,6 +58,34 @@ function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+/** Delays before automatic retries of a part that failed for a temporary reason. Tests shorten this. */
+export const retryConfig = { delaysMs: [2000, 5000] };
+
+/** A failed attempt for one part, with a hint about whether trying again can help. */
+class PartError extends Error {
+  constructor(message: string, public retryable: boolean) {
+    super(message);
+  }
+}
+
+/** Waits `ms`, but rejects straight away if the signal aborts (Pause / Cancel). */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+const TEMPORARY_STATUSES = [408, 429, 500, 502, 503, 504];
+
 const rangeLabel = (c: AudioChunk) => `${formatTimestamp(c.startTimeSec)} - ${formatTimestamp(c.endTimeSec)}`;
 const DEFAULT_TITLES = ['Voice Recording', 'New Transcription'];
 
@@ -101,11 +129,14 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
     };
   };
 
-  const transcribeOne = async (s: Session, index: number, signal: AbortSignal): Promise<ChunkOutput> => {
+  /** One attempt at one part. Throws a PartError that says whether a retry is worthwhile. */
+  const requestPart = async (
+    s: Session,
+    index: number,
+    base64Audio: string,
+    signal: AbortSignal
+  ): Promise<ChunkOutput> => {
     const chunk = s.chunks[index];
-    const base64Audio = await blobToBase64(chunk.blob);
-    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-
     const response = await fetch('/api/transcribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -123,6 +154,7 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
       }),
     });
 
+    // A proxy can answer with an HTML page instead of JSON (for example while the app warms up).
     let data: any = null;
     try {
       data = await response.json();
@@ -130,11 +162,16 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
       data = null;
     }
     if (!response.ok || !data || !Array.isArray(data.segments)) {
-      throw new Error(
+      const retryable =
+        typeof data?.retryable === 'boolean'
+          ? data.retryable
+          : response.ok || TEMPORARY_STATUSES.includes(response.status);
+      throw new PartError(
         data?.error ||
           (!response.ok
             ? `Transcription failed (HTTP ${response.status}).`
-            : 'Server returned an invalid response. Please retry this part.')
+            : 'Server returned an invalid response. Please retry this part.'),
+        retryable
       );
     }
 
@@ -144,6 +181,27 @@ export function useTranscriber({ addItem, updateItem, onStarted }: Deps) {
         ? data.speakerProfiles
         : undefined;
     return { segments, flags: (data.flags ?? []) as QualityFlag[], speakerProfiles };
+  };
+
+  /** Transcribes one part, automatically retrying temporary failures a couple of times. */
+  const transcribeOne = async (s: Session, index: number, signal: AbortSignal): Promise<ChunkOutput> => {
+    const base64Audio = await blobToBase64(s.chunks[index].blob);
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await requestPart(s, index, base64Audio, signal);
+      } catch (err: any) {
+        if (signal.aborted || err?.name === 'AbortError') throw err;
+        // A thrown TypeError is a network failure, which is worth retrying.
+        const retryable = err instanceof PartError ? err.retryable : true;
+        if (!retryable || attempt >= retryConfig.delaysMs.length) throw err;
+        setStatusText(
+          `Part ${index + 1} of ${s.chunks.length} is slow or busy; retrying (${attempt + 2}/${retryConfig.delaysMs.length + 1})...`
+        );
+        await sleep(retryConfig.delaysMs[attempt], signal);
+      }
+    }
   };
 
   const commitChunk = (s: Session, index: number, output: ChunkOutput) => {

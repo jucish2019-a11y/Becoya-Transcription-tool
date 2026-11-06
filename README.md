@@ -54,14 +54,22 @@ The API key is read only by the server at runtime. It is never included in the b
 
 1. The browser decodes the file at 16 kHz (so hour-long recordings do not exhaust memory), finds quiet points, and re-encodes each part as mono 16 kHz WAV.
 2. Each part is sent to `/api/transcribe` with the language, speaker count, vocabulary, the speakers identified so far and the last few turns of the previous part.
-3. The model must answer with a JSON schema (`speaker`, `start`, `text`). The server validates it, retries on rate limits and malformed output, repairs bad timestamps, and runs the quality checks.
+3. The model must answer with a JSON schema (`speaker`, `start`, `text`). The server validates it, retries malformed output once, repairs bad timestamps, and runs the quality checks.
 4. Speaker ids are always `Speaker N`, so they stay stable between parts; give them real names afterwards with **Speakers**.
 
-Which models appear in the dropdown comes from `src/shared/models.ts`, filtered at runtime against `models.list()` for your API key, so an unavailable model is hidden instead of failing every request.
+## Models, speed and reliability
+
+- **Default: Gemini 3.8 Flash**, called with low "thinking" (the default thinking depth adds many seconds and does nothing for transcription). `gemini-3.7-flash` and `gemini-3.5-flash` are deprecated aliases that Google routes to 3.8 and 3.6 Flash, so they are not offered but still work for old transcripts.
+- Which models appear in the dropdown comes from `src/shared/models.ts`, filtered at runtime against `models.list()` for your API key, so an unavailable model is hidden instead of failing every request.
+- **Time budget.** One request may take at most `GEMINI_BUDGET_MS` (default 50 s) so it ends before a proxy gives up. The selected model gets `GEMINI_TIMEOUT_MS` (default 35 s); if it is slow or overloaded, the call is **cancelled** and a single attempt is made on Gemini 3.1 Flash-Lite with the time left.
+- **A swap is never silent.** If Flash-Lite had to step in, that part is flagged ("Retry part" re-runs it on the model you chose) and the response says which model produced it.
+- **Automatic retries.** If a part fails for a temporary reason (busy model, timeout, network drop, or a proxy error page), the browser retries it twice (after 2 s and 5 s) before stopping. Pause and Cancel work during the wait; "Continue" resumes from the failed part.
+- **Gemini 3.5 Transcribe** is a dedicated speech-to-text model that uses a different Google API (Interactions with `transcriptionConfig`), with its own `spk_N` speaker labels and no prompt, so it is not offered yet.
 
 ## Limits
 
 - Cloud Run rejects request bodies over 32 MB. Parts are ~10 MB, but if a file cannot be decoded in the browser it is uploaded as-is and may be too large.
 - The audio player and *Retry part* are available for transcriptions made in the current browser session (the audio is not stored).
 - Transcripts live in the browser's `localStorage` (about 5 MB). Export or delete old ones if the app warns that storage is full.
+- **Suggest speaker fixes** reads the text only (it cannot hear the audio), so it can only catch mix-ups that the conversation itself reveals. It never invents new speakers, changes nothing you have not been told about, and can be undone.
 - Speaker separation and timestamps come from the model and are not perfect: review flagged parts, and use the speaker count hint for tricky recordings.

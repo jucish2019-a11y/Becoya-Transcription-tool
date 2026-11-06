@@ -21,7 +21,7 @@ vi.mock('../src/utils/audioChunker', async (orig) => {
 });
 
 import { useHistory } from '../src/hooks/useHistory';
-import { TranscribeOptions, useTranscriber } from '../src/hooks/useTranscriber';
+import { TranscribeOptions, retryConfig, useTranscriber } from '../src/hooks/useTranscriber';
 
 const options: TranscribeOptions = {
   model: 'gemini-3.7-flash',
@@ -45,7 +45,7 @@ function mockServer(opts: { delayMs?: number; failPart?: number } = {}) {
     if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
     if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (opts.failPart === body.chunk.index) {
-      return { ok: false, status: 502, json: async () => ({ error: 'boom' }) };
+      return { ok: false, status: 500, json: async () => ({ error: 'boom', retryable: false }) };
     }
     const i = body.chunk.index;
     return {
@@ -64,7 +64,10 @@ function mockServer(opts: { delayMs?: number; failPart?: number } = {}) {
   return { calls, fetchMock };
 }
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  retryConfig.delaysMs = [1, 1]; // keep automatic retries fast in tests
+});
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
@@ -224,5 +227,126 @@ describe('useTranscriber', () => {
     expect(result.current.t.session?.status).toBe('failed');
     expect(result.current.t.error).toContain('Server returned an invalid response');
     expect(result.current.t.error).not.toContain('Cannot read properties of null');
+  });
+
+  describe('automatic retry of temporary failures', () => {
+    const okBody = (body: any) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        segments: [{ speaker: 'Speaker 1', start: body.chunk.startSec + 1, text: `part ${body.chunk.index}` }],
+        flags: [],
+      }),
+    });
+
+    /** `script(callNumberForThisPart, body)` returns the fake response; calls are recorded per part. */
+    function scriptedServer(script: (n: number, body: any) => any) {
+      const perPart: Record<number, number> = {};
+      const fetchMock = vi.fn(async (_url: string, init: any) => {
+        const body = JSON.parse(init.body);
+        perPart[body.chunk.index] = (perPart[body.chunk.index] ?? 0) + 1;
+        return script(perPart[body.chunk.index], body);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return { perPart, fetchMock };
+    }
+
+    it('retries a busy part and then carries on without bothering the user', async () => {
+      const { perPart } = scriptedServer((n, body) =>
+        body.chunk.index === 1 && n === 1
+          ? { ok: false, status: 500, json: async () => ({ error: 'busy', retryable: true }) }
+          : okBody(body)
+      );
+      const { result } = renderHook(useBoth);
+      await act(async () => {
+        await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      expect(perPart).toEqual({ 0: 1, 1: 2, 2: 1 });
+      expect(result.current.t.session?.status).toBe('completed');
+      expect(result.current.t.error).toBe('');
+      expect(result.current.history[0].segments).toHaveLength(3);
+    });
+
+    it('gives up after the retries are used up and reports which part failed', async () => {
+      const { perPart } = scriptedServer((_n, body) =>
+        body.chunk.index === 0
+          ? { ok: false, status: 500, json: async () => ({ error: 'still busy', retryable: true }) }
+          : okBody(body)
+      );
+      const { result } = renderHook(useBoth);
+      await act(async () => {
+        await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      expect(perPart[0]).toBe(1 + retryConfig.delaysMs.length); // first try + 2 retries
+      expect(result.current.t.session?.status).toBe('failed');
+      expect(result.current.t.error).toContain('Part 1 of 3');
+      expect(result.current.t.error).toContain('still busy');
+    });
+
+    it('treats a proxy HTML page (non-JSON 504) as temporary', async () => {
+      const { perPart } = scriptedServer((n, body) =>
+        n === 1 && body.chunk.index === 0
+          ? { ok: false, status: 504, json: async () => { throw new SyntaxError('Unexpected token <'); } }
+          : okBody(body)
+      );
+      const { result } = renderHook(useBoth);
+      await act(async () => {
+        await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      expect(perPart[0]).toBe(2);
+      expect(result.current.t.session?.status).toBe('completed');
+    });
+
+    it('retries a network failure', async () => {
+      const { perPart } = scriptedServer((n, body) => {
+        if (n === 1 && body.chunk.index === 0) throw new TypeError('Failed to fetch');
+        return okBody(body);
+      });
+      const { result } = renderHook(useBoth);
+      await act(async () => {
+        await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      expect(perPart[0]).toBe(2);
+      expect(result.current.t.session?.status).toBe('completed');
+    });
+
+    it('does not retry a permanent error', async () => {
+      const { perPart } = scriptedServer(() => ({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: 'Unknown model: x.', retryable: false }),
+      }));
+      const { result } = renderHook(useBoth);
+      await act(async () => {
+        await result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      expect(perPart[0]).toBe(1);
+      expect(result.current.t.session?.status).toBe('failed');
+    });
+
+    it('pausing during the wait between retries stops without another attempt', async () => {
+      retryConfig.delaysMs = [400];
+      const { perPart } = scriptedServer(() => ({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'busy', retryable: true }),
+      }));
+      const { result } = renderHook(useBoth);
+
+      let done!: Promise<void>;
+      act(() => {
+        done = result.current.t.start(new Blob(['x']), 'audio/mpeg', 'Interview', options);
+      });
+      await waitFor(() => expect(result.current.t.statusText).toContain('retrying'));
+      act(() => result.current.t.pause());
+      await act(async () => {
+        await done;
+        await new Promise((r) => setTimeout(r, 500));
+      });
+
+      expect(perPart[0]).toBe(1);
+      expect(result.current.t.session?.status).toBe('paused');
+      expect(result.current.t.isTranscribing).toBe(false);
+    });
   });
 });

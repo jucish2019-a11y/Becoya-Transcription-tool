@@ -1,81 +1,28 @@
 import express, { NextFunction, Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
+import {
+  buildFixPrompt,
+  FIX_SCHEMA,
+  sanitizeCorrections,
+  validateFixRequest,
+} from './server/fixSpeakers';
+import { createGenerate, defaultFailoverOptions, runWithFailover, thinkingConfigFor } from './server/generate';
 import { listUsableModels } from './server/models';
 import {
-  GenerateFn,
-  GenerateResult,
   ParseError,
-  RESPONSE_SCHEMA,
   RequestError,
+  UpstreamTimeoutError,
   isRetryable,
   transcribeChunk,
   validateRequest,
 } from './server/transcribe';
+import { modelLabel } from './src/shared/models';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
-
-function createGenerate(ai: GoogleGenAI): GenerateFn {
-  return async (p) => {
-    async function executeWithModel(modelName: string): Promise<GenerateResult> {
-      // ThinkingLevel.LOW eliminates deep reasoning pauses for models with thinking enabled (3.7 Flash only)
-      const thinkingConfig =
-        modelName === 'gemini-3.7-flash'
-          ? { thinkingLevel: ThinkingLevel.LOW }
-          : undefined;
-
-      const callPromise = ai.models.generateContent({
-        model: modelName,
-        contents: [
-          {
-            role: 'user',
-            parts: [{ inlineData: { mimeType: p.mimeType, data: p.base64Audio } }, { text: p.userText }],
-          },
-        ],
-        config: {
-          systemInstruction: p.systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: RESPONSE_SCHEMA,
-          maxOutputTokens: 8192,
-          ...(thinkingConfig ? { thinkingConfig } : {}),
-          ...(p.temperature !== undefined ? { temperature: p.temperature } : {}),
-        },
-      });
-
-      // 18s timeout per model attempt to prevent hanging on demand spikes
-      const timeoutMs = 18000;
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Model ${modelName} request timed out after 18s`)), timeoutMs)
-      );
-
-      const response = await Promise.race([callPromise, timeoutPromise]);
-      return { text: response.text ?? '', finishReason: response.candidates?.[0]?.finishReason };
-    }
-
-    try {
-      return await executeWithModel(p.model);
-    } catch (err: any) {
-      const status = err?.status ?? err?.code ?? err?.error?.code;
-      const msg = String(err?.message ?? err).toLowerCase();
-      const isDemandSpikeOrTimeoutOrQuota =
-        status === 503 ||
-        status === 429 ||
-        status === 404 ||
-        /timed? ?out|demand|unavailable|overloaded|resource_exhausted|not found|no longer available/.test(msg);
-
-      if (isDemandSpikeOrTimeoutOrQuota && p.model !== 'gemini-3.1-flash-lite') {
-        console.warn(
-          `[Speed & Reliability Optimizer] Model ${p.model} encountered ${status || 'timeout/spike'}. Instantly failing over to gemini-3.1-flash-lite.`
-        );
-        return await executeWithModel('gemini-3.1-flash-lite');
-      }
-      throw err;
-    }
-  };
-}
 
 async function main() {
   const app = express();
@@ -111,78 +58,60 @@ async function main() {
         return res.status(err.status).json({ error: err.message });
       }
       console.error('Transcription error:', err?.message ?? err);
-      // NGINX has error_page 502 503 504 configured to serve warmup.html; use 500 so JSON errors reach the client
+      // The hosting proxy replaces 502/503/504 with an HTML warm-up page, so send errors as 500 (or 429)
+      // with a JSON body the client can read.
       const status = typeof err?.status === 'number' && err.status === 429 ? 429 : 500;
-      const message =
-        err instanceof ParseError
-          ? 'The model returned an unreadable response. Please retry this part.'
-          : err?.message || 'Failed to transcribe audio.';
-      res.status(status).json({ error: message, retryable: isRetryable(err) || err instanceof ParseError });
+      let message: string;
+      let retryable: boolean;
+      if (err instanceof UpstreamTimeoutError) {
+        message = `${modelLabel(err.model)} did not answer in time. Retrying usually works.`;
+        retryable = true;
+      } else if (err instanceof ParseError) {
+        message = 'The model returned an unreadable response. Please retry this part.';
+        retryable = true;
+      } else {
+        message = err?.message || 'Failed to transcribe audio.';
+        retryable = isRetryable(err);
+      }
+      res.status(status).json({ error: message, retryable });
     }
   });
 
   app.post('/api/fix-speakers', async (req: Request, res: Response) => {
     try {
-      if (!ai) {
-        return res.status(500).json({ error: 'The server has no GEMINI_API_KEY configured.' });
-      }
-      const { segments, expectedSpeakers, speakerNames } = req.body ?? {};
-      if (!Array.isArray(segments) || segments.length === 0) {
-        return res.status(400).json({ error: 'Missing segments to fix.' });
-      }
+      if (!ai) return res.status(500).json({ error: 'The server has no GEMINI_API_KEY configured.' });
+      const fix = validateFixRequest(req.body);
+      const { systemInstruction, prompt } = buildFixPrompt(fix);
 
-      const turnsText = segments
-        .map((s: any, idx: number) => `Turn ${idx + 1} [id: ${s.id}] [${s.speaker}]: ${s.text}`)
-        .join('\n');
-
-      const prompt = [
-        'Analyze the dialogue turns below where speaker labels may have been mixed up or swapped across parts.',
-        'Evaluate the conversational flow (question vs answer, topics, introductions, references, turn-taking).',
-        expectedSpeakers ? `There are about ${expectedSpeakers} speaker(s) in this conversation.` : '',
-        speakerNames && Object.keys(speakerNames).length > 0
-          ? `Known speaker names: ${JSON.stringify(speakerNames)}`
-          : '',
-        'Assign each turn to the correct speaker label (e.g. "Speaker 1", "Speaker 2").',
-        'Output a correction entry for EVERY segment ID provided.',
-        '',
-        turnsText,
-      ]
-        .filter(Boolean)
-        .join('\n\n');
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          systemInstruction:
-            'You are an expert dialogue editor. You align and untangle mixed up speaker turns in conversation transcripts based on dialogue flow, questions/answers, and topic coherence. Output the corrected speaker label for every segment ID without omitting any.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              corrections: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    speaker: { type: Type.STRING },
-                  },
-                  required: ['id', 'speaker'],
-                },
-              },
+      const { value } = await runWithFailover(
+        fix.model,
+        async (model, signal) => {
+          const response = await ai.models.generateContent({
+            model,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: {
+              abortSignal: signal,
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: FIX_SCHEMA,
+              maxOutputTokens: 8192,
+              ...thinkingConfigFor(model),
             },
-            required: ['corrections'],
-          },
+          });
+          return response.text ?? '';
         },
-      });
+        defaultFailoverOptions()
+      );
 
-      const parsed = JSON.parse(response.text || '{}');
-      const corrections = Array.isArray(parsed?.corrections) ? parsed.corrections : [];
-      res.json({ corrections });
+      res.json({ corrections: sanitizeCorrections(value, fix) });
     } catch (err: any) {
+      if (err instanceof RequestError) return res.status(err.status).json({ error: err.message });
       console.error('Fix speakers error:', err?.message ?? err);
-      res.status(500).json({ error: err?.message || 'Failed to untangle speakers.' });
+      const message =
+        err instanceof UpstreamTimeoutError
+          ? 'The speaker check took too long. Please try again.'
+          : err?.message || 'Failed to check speakers.';
+      res.status(500).json({ error: message });
     }
   });
 

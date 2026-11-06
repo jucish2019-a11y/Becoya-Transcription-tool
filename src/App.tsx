@@ -33,11 +33,12 @@ import { TranscriptPanel } from './components/TranscriptPanel';
 import { HistoryItem, useHistory } from './hooks/useHistory';
 import { useRecorder } from './hooks/useRecorder';
 import { useTranscriber } from './hooks/useTranscriber';
-import { MODELS, ModelInfo, modelLabel } from './shared/models';
+import { DEFAULT_MODEL_ID, MODELS, ModelInfo, modelLabel } from './shared/models';
 import { LANGUAGE_LABELS, LanguageHint, TranscriptionStyle } from './shared/transcript';
 import { formatSecondsToTime } from './utils/audioChunker';
 
-const PREFS_KEY = 'transcriberPrefs';
+// v2: the default model changed, so older saved choices (often the old Flash-Lite default) are ignored once.
+const PREFS_KEY = 'transcriberPrefs.v2';
 
 interface Prefs {
   model?: string;
@@ -61,7 +62,7 @@ export default function App() {
   // Settings (remembered between visits)
   const prefs = useMemo(loadPrefs, []);
   const [models, setModels] = useState<ModelInfo[]>(MODELS);
-  const [selectedModel, setSelectedModel] = useState(prefs.model || MODELS[0].id);
+  const [selectedModel, setSelectedModel] = useState(prefs.model || DEFAULT_MODEL_ID);
   const [transcriptionStyle, setTranscriptionStyle] = useState<TranscriptionStyle>(prefs.style || 'verbatim');
   const [language, setLanguage] = useState<LanguageHint>(prefs.language || 'auto');
   const [expectedSpeakers, setExpectedSpeakers] = useState(prefs.expectedSpeakers || '');

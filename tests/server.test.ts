@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import { temperatureFor } from '../src/shared/models';
 import {
   RequestError,
+  UpstreamTimeoutError,
   buildPrompt,
   isRetryable,
   parseModelJson,
@@ -29,6 +31,13 @@ describe('validateRequest', () => {
     expect(() => validateRequest({ ...base, base64Audio: '' })).toThrow(RequestError);
     expect(() => validateRequest({ ...base, mimeType: 'text/html' })).toThrow(RequestError);
     expect(() => validateRequest(null)).toThrow(RequestError);
+  });
+  it('explains why the transcribe-only model cannot be used', () => {
+    expect(() => validateRequest({ ...base, model: 'gemini-3.5-transcribe' })).toThrow(/different Google API/);
+  });
+  it('still accepts deprecated aliases that old saved transcripts may carry', () => {
+    expect(validateRequest({ ...base, model: 'gemini-3.7-flash' }).model).toBe('gemini-3.7-flash');
+    expect(validateRequest({ ...base, model: 'gemini-3.8-flash' }).model).toBe('gemini-3.8-flash');
   });
   it('falls back to safe defaults', () => {
     const r = validateRequest({ ...base, style: 'weird', language: 'xx', expectedSpeakers: 99 });
@@ -151,11 +160,40 @@ describe('transcribeChunk', () => {
     const r = await transcribeChunk(generate, validateRequest(base));
     expect(r.flags.map((f) => f.code)).toContain('truncated');
   });
-  it('does not send temperature for Gemini 3.x but does for older models', async () => {
+  it('does not send a temperature for Gemini 3.x models', async () => {
     const generate = vi.fn().mockResolvedValue({ text: good });
     await transcribeChunk(generate, validateRequest(base));
     expect(generate.mock.calls[0][0].temperature).toBeUndefined();
-    await transcribeChunk(generate, validateRequest({ ...base, model: 'gemini-2.5-flash' }));
-    expect(generate.mock.calls[1][0].temperature).toBe(0);
+    expect(temperatureFor('gemini-3.8-flash')).toBeUndefined();
+    expect(temperatureFor('gemini-2.5-flash')).toBe(0);
+  });
+
+  it('reports which model produced the part and flags a fallback', async () => {
+    const generate = vi.fn().mockResolvedValue({
+      text: good,
+      modelUsed: 'gemini-3.1-flash-lite',
+      fallbackFrom: 'gemini-3.8-flash',
+      fallbackReason: 'no answer within 35s',
+    });
+    const r = await transcribeChunk(generate, validateRequest({ ...base, model: 'gemini-3.8-flash' }));
+    expect(r.modelUsed).toBe('gemini-3.1-flash-lite');
+    const flag = r.flags.find((f) => f.code === 'model_fallback');
+    expect(flag?.chunk).toBe(1);
+    expect(flag?.message).toContain('3.8 Flash');
+    expect(flag?.message).toContain('3.1 Flash-Lite');
+  });
+
+  it('does not flag anything when the requested model answered', async () => {
+    const generate = vi.fn().mockResolvedValue({ text: good, modelUsed: 'gemini-3.8-flash' });
+    const r = await transcribeChunk(generate, validateRequest({ ...base, model: 'gemini-3.8-flash' }));
+    expect(r.flags.map((f) => f.code)).not.toContain('model_fallback');
+  });
+
+  it('never retries an upstream timeout (the failover layer already spent the time budget)', async () => {
+    const generate = vi.fn().mockRejectedValue(new UpstreamTimeoutError('gemini-3.8-flash', 35000));
+    await expect(transcribeChunk(generate, validateRequest(base), { sleepFn: async () => {} })).rejects.toBeInstanceOf(
+      UpstreamTimeoutError
+    );
+    expect(generate).toHaveBeenCalledTimes(1);
   });
 });

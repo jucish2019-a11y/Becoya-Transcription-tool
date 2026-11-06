@@ -146,41 +146,42 @@ export function TranscriptPanel({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          segments: segments.map((s) => ({ id: s.id, speaker: s.speaker, text: s.text, start: s.start })),
-          expectedSpeakers: speakers.length,
+          segments: segments.map((s) => ({ id: s.id, speaker: s.speaker, text: s.text })),
           speakerNames: names,
+          model: item?.model,
         }),
       });
-      if (!res.ok) throw new Error('Failed to untangle speakers.');
-      const data = await res.json();
-      const corrections: Array<{ id: string; speaker: string }> = data.corrections || [];
-      if (!corrections.length) {
-        showNotice('No speaker changes needed; dialogue is aligned.');
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        /* proxy error page */
+      }
+      if (!res.ok) throw new Error(data?.error || `The speaker check failed (HTTP ${res.status}).`);
+
+      // Work out the changes up front. (Counting inside a state updater is unreliable because
+      // React runs updaters later, which made the old message wrong.)
+      const known = new Set(segments.map((s) => s.speaker));
+      const byId = new Map<string, string>();
+      for (const c of Array.isArray(data?.corrections) ? data.corrections : []) {
+        if (typeof c?.id === 'string' && typeof c?.speaker === 'string' && known.has(c.speaker)) {
+          byId.set(c.id, c.speaker);
+        }
+      }
+      const snapshot = segments;
+      const changed = segments.filter((s) => byId.has(s.id) && byId.get(s.id) !== s.speaker).length;
+      if (changed === 0) {
+        showNotice('No clear speaker mix-ups found in the text.');
         return;
       }
-      const corrMap = new Map(corrections.map((c) => [c.id, c.speaker]));
-      let changed = 0;
-      const snapshot = segments;
-      onSegments((segs) =>
-        segs.map((s) => {
-          const corrected = corrMap.get(s.id);
-          if (corrected && corrected !== s.speaker) {
-            changed++;
-            return { ...s, speaker: corrected };
-          }
-          return s;
-        })
-      );
-      showNotice(
-        changed > 0 ? `Untangled speakers: corrected ${changed} turn(s).` : 'Speakers are already consistently aligned.',
-        snapshot
-      );
+      onSegments((segs) => segs.map((s) => (byId.has(s.id) ? { ...s, speaker: byId.get(s.id)! } : s)));
+      showNotice(`Changed the speaker on ${changed} turn${changed === 1 ? '' : 's'}. Please review them.`, snapshot);
     } catch (err: any) {
-      showNotice(err?.message || 'Could not untangle speakers.');
+      showNotice(err?.message || 'Could not check speakers.');
     } finally {
       setIsFixingSpeakers(false);
     }
-  }, [segments, isFixingSpeakers, speakers.length, names, onSegments, showNotice]);
+  }, [segments, isFixingSpeakers, names, item?.model, onSegments, showNotice]);
 
   const doReplace = (close: () => void) => {
     const snapshot = segments;
@@ -294,7 +295,7 @@ export function TranscriptPanel({
               }
             >
               {() => (
-                <div className="space-y-3 w-72">
+                <div className="space-y-3">
                   <div>
                     <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1">
                       Speaker Names
@@ -381,12 +382,12 @@ export function TranscriptPanel({
                       {isFixingSpeakers ? (
                         <>
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          Untangling speaker turns...
+                          Checking speaker turns...
                         </>
                       ) : (
                         <>
                           <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                          Fix Speaker Mix-Up with AI
+                          Suggest speaker fixes (AI)
                         </>
                       )}
                     </button>
@@ -462,15 +463,15 @@ export function TranscriptPanel({
                 onClick={doUntangleSpeakers}
                 disabled={isTranscribing || isFixingSpeakers}
                 className={subtleButton}
-                title="AI analyzes conversation flow and automatically aligns swapped or misattributed speaker turns"
-                aria-label="Fix speakers"
+                title="AI reads the text (it cannot hear the audio) and suggests speaker changes where the conversation clearly shows a mix-up. You can undo it."
+                aria-label="Suggest speaker fixes"
               >
                 {isFixingSpeakers ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" aria-hidden="true" />
                 ) : (
                   <Sparkles className="h-3.5 w-3.5 text-indigo-600" aria-hidden="true" />
                 )}
-                {isFixingSpeakers ? 'Fixing…' : 'Fix speakers'}
+                {isFixingSpeakers ? 'Checking…' : 'Check speakers'}
               </button>
             )}
 
