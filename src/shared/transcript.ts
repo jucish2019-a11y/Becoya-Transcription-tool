@@ -24,7 +24,8 @@ export type FlagCode =
   | 'repetition'
   | 'empty'
   | 'truncated'
-  | 'approx_timestamps';
+  | 'approx_timestamps'
+  | 'model_fallback';
 
 export interface QualityFlag {
   chunk: number;

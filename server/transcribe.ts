@@ -1,5 +1,5 @@
 import { Type } from '@google/genai';
-import { ALLOWED_MODEL_IDS, temperatureFor } from '../src/shared/models';
+import { ALLOWED_MODEL_IDS, UNSUPPORTED_MODELS, modelLabel, temperatureFor } from '../src/shared/models';
 import {
   ChunkInfo,
   LanguageHint,
@@ -39,6 +39,8 @@ export interface TranscribeResponse {
   /** Turns with timestamps in seconds from the start of the full recording. */
   segments: RawSegment[];
   flags: QualityFlag[];
+  /** The model that produced this part (can differ from the one requested after a failover). */
+  modelUsed?: string;
   speakerProfiles?: Record<string, string>;
 }
 
@@ -60,6 +62,19 @@ export interface GenerateParams {
 export interface GenerateResult {
   text: string;
   finishReason?: string;
+  /** The model that actually produced the text (differs from the request after a failover). */
+  modelUsed?: string;
+  /** Set when the requested model was swapped for a faster one. */
+  fallbackFrom?: string;
+  fallbackReason?: string;
+}
+
+/** The upstream model did not answer in time and the request was cancelled. */
+export class UpstreamTimeoutError extends Error {
+  constructor(public model: string, public timeoutMs: number) {
+    super(`${model} did not answer within ${Math.round(timeoutMs / 1000)}s`);
+    this.name = 'UpstreamTimeoutError';
+  }
 }
 
 export type GenerateFn = (params: GenerateParams) => Promise<GenerateResult>;
@@ -89,6 +104,9 @@ export function validateRequest(body: any): TranscribeRequest {
   const mimeType = normalizeMimeType(body.mimeType);
   if (!mimeType.startsWith('audio/') && mimeType !== 'video/webm' && mimeType !== 'video/mp4') {
     throw new RequestError(`Unsupported audio type: ${mimeType || 'unknown'}.`);
+  }
+  if (typeof model === 'string' && UNSUPPORTED_MODELS[model]) {
+    throw new RequestError(UNSUPPORTED_MODELS[model]);
   }
   if (typeof model !== 'string' || !ALLOWED_MODEL_IDS.has(model)) {
     throw new RequestError(`Unknown model: ${String(model)}.`);
@@ -334,6 +352,8 @@ function errorStatus(err: any): number | undefined {
 
 export function isRetryable(err: unknown): boolean {
   if (err instanceof RequestError) return false;
+  // The failover layer has already used the time budget; retrying here would multiply it.
+  if (err instanceof UpstreamTimeoutError) return false;
   const status = errorStatus(err);
   if (status && [408, 429, 500, 502, 503, 504].includes(status)) return true;
   const msg = String((err as any)?.message ?? err).toLowerCase();
@@ -384,11 +404,13 @@ export async function transcribeChunk(
   // Up to two attempts for malformed/truncated output; transport errors have their own retry.
   let parsed: ReturnType<typeof parseModelJson> | null = null;
   let truncated = false;
+  let used: GenerateResult | null = null;
   let lastError: unknown;
   for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
     const result = await withRetry(() => generate(params), retryOpts);
     try {
       parsed = parseModelJson(result.text);
+      used = result;
       truncated = result.finishReason === 'MAX_TOKENS';
     } catch (err) {
       lastError = err;
@@ -423,9 +445,20 @@ export async function transcribeChunk(
     });
   }
 
+  const modelUsed = used?.modelUsed ?? req.model;
+  if (used?.fallbackFrom || modelUsed !== req.model) {
+    const from = used?.fallbackFrom ?? req.model;
+    flags.push({
+      ...flagBase,
+      code: 'model_fallback',
+      message: `${modelLabel(from)} was slow or busy (${used?.fallbackReason ?? 'no answer in time'}), so ${modelLabel(modelUsed)} transcribed this part. Speaker separation may be weaker; use Retry part when it is less busy.`,
+    });
+  }
+
   return {
     segments,
     flags,
+    modelUsed,
     speakerProfiles: (parsed as any)?.speakerProfiles,
   };
 }
